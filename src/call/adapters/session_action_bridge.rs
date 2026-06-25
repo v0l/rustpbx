@@ -273,7 +273,8 @@ pub fn call_command_to_session_action(cmd: CallCommand) -> Result<SessionAction>
         CallCommand::LegAdd { .. }
         | CallCommand::LegRemove { .. }
         | CallCommand::LegConnected { .. }
-        | CallCommand::LegFailed { .. } => {
+        | CallCommand::LegFailed { .. }
+        | CallCommand::LegRinging { .. } => {
             Err(AdapterError::NotSupported("dynamic leg commands".to_string()).into())
         }
     }

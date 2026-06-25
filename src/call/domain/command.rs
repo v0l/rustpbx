@@ -428,6 +428,19 @@ pub enum CallCommand {
         /// Failure reason
         reason: String,
     },
+
+    /// Leg started ringing / produced early media (async notification).
+    ///
+    /// Emitted when a callee leg returns a provisional response (180 Ringing
+    /// or 183 Session Progress). The session relays this to the caller so the
+    /// caller hears ringback while an app/queue is still hunting for an agent
+    /// (i.e. when the caller dialog has not yet been answered).
+    LegRinging {
+        /// Leg ID that is ringing
+        leg_id: LegId,
+        /// Optional early-media SDP (present for 183 Session Progress)
+        sdp: Option<String>,
+    },
 }
 
 /// Point-to-point bridge mode

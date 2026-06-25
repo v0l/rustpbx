@@ -8295,6 +8295,11 @@ impl SipSession {
                 CommandResult::success()
             }
 
+            CallCommand::LegRinging { leg_id, sdp } => {
+                self.handle_leg_ringing(leg_id, sdp).await;
+                CommandResult::success()
+            }
+
             CallCommand::LegFailed { leg_id, reason } => {
                 warn!(%leg_id, %reason, "Leg failed async notification");
                 // Forward to running app before removing the leg (so we can get the URI)
@@ -8329,6 +8334,71 @@ impl SipSession {
             }
 
             _ => CommandResult::not_supported("Command not yet implemented"),
+        }
+    }
+
+    /// Relay a callee leg's ringback / early media to the caller.
+    ///
+    /// This makes the caller hear ringing while an app/queue hunts for an
+    /// agent. It only acts while the caller dialog is still un-answered
+    /// (not confirmed); once the caller is answered there is no provisional
+    /// response to send and audio flows over the established media path.
+    ///
+    /// - 183 Session Progress (SDP present): bridge the callee's early media
+    ///   to the caller so the caller hears the agent endpoint's own ringback.
+    /// - 180 Ringing (no SDP): forward a 180 so the caller's carrier generates
+    ///   local ringback tone.
+    async fn handle_leg_ringing(&mut self, leg_id: LegId, sdp: Option<String>) {
+        if self.server_dialog.state().is_confirmed() {
+            // Caller already answered — nothing to relay.
+            return;
+        }
+
+        match sdp {
+            Some(callee_sdp) if !callee_sdp.is_empty() && callee_sdp.contains("v=0") => {
+                if self.media.early_media_sent {
+                    self.update_leg_state(&leg_id, LegState::EarlyMedia);
+                    return;
+                }
+                self.update_leg_state(&leg_id, LegState::EarlyMedia);
+
+                if self.media_profile.path == MediaPathMode::Anchored {
+                    let caller_sdp = self
+                        .prepare_caller_answer_from_callee_sdp(Some(callee_sdp), false, true)
+                        .await;
+                    if let Some(caller_sdp) = caller_sdp {
+                        self.media.early_media_sent = true;
+                        if let Err(e) = self
+                            .server_dialog
+                            .ringing(Some(Self::sdp_headers()), Some(caller_sdp.into_bytes()))
+                        {
+                            warn!(%leg_id, error = %e, "Failed to relay 183 early media to caller");
+                        } else {
+                            info!(%leg_id, "Relayed 183 early media (ringback) to caller");
+                        }
+                    }
+                } else {
+                    self.media.early_media_sent = true;
+                    if let Err(e) = self
+                        .server_dialog
+                        .ringing(Some(Self::sdp_headers()), Some(callee_sdp.into_bytes()))
+                    {
+                        warn!(%leg_id, error = %e, "Failed to relay provisional SDP to caller");
+                    } else {
+                        info!(%leg_id, "Relayed provisional SDP (ringback) to caller");
+                    }
+                }
+            }
+            _ => {
+                if !self.media.early_media_sent {
+                    self.update_leg_state(&leg_id, LegState::Ringing);
+                }
+                if let Err(e) = self.server_dialog.ringing(None, None) {
+                    warn!(%leg_id, error = %e, "Failed to send 180 Ringing to caller");
+                } else {
+                    debug!(%leg_id, "Forwarded 180 Ringing to caller");
+                }
+            }
         }
     }
 
@@ -8622,7 +8692,9 @@ impl SipSession {
                             Some(rsipstack::dialog::dialog::DialogState::Early(_, ref resp)) => {
                                 info!(%leg_id, "SIP leg early media (183)");
                                 let body = resp.body();
-                                if !body.is_empty() {
+                                let early_sdp = if body.is_empty() {
+                                    None
+                                } else {
                                     let sdp = String::from_utf8_lossy(body).to_string();
                                     if let Err(e) =
                                         peer.update_remote_description(&track_id, &sdp).await
@@ -8631,7 +8703,17 @@ impl SipSession {
                                     } else {
                                         info!(%leg_id, "Early media remote description set");
                                     }
-                                }
+                                    Some(sdp)
+                                };
+                                // Relay ringback / early media to the caller so the
+                                // caller hears ringing while an app/queue is hunting
+                                // (caller dialog not yet answered).
+                                let _ = cmd_tx
+                                    .send(CallCommand::LegRinging {
+                                        leg_id: leg_id.clone(),
+                                        sdp: early_sdp,
+                                    })
+                                    .await;
                             }
                             Some(_) => {}
                             None => { state_rx_open = false; }
