@@ -156,7 +156,7 @@ impl SipSession {
     pub(super) async fn dial_queue_sequential(
         &mut self,
         agents: &[crate::call::Location],
-        _ring_timeout: Option<Duration>,
+        ring_timeout: Option<Duration>,
         callee_state_rx: &mut mpsc::UnboundedReceiver<DialogState>,
     ) -> Result<(), CalleeError> {
         let mut last_error = into_callee_err(
@@ -172,10 +172,30 @@ impl SipSession {
 
             info!(index = idx, agent = %agent.aor, "Queue: trying agent");
 
-            match self
-                .try_single_target(agent, callee_state_rx, Some(Self::QUEUE_HOLD_TRACK_ID))
-                .await
-            {
+            // Enforce the per-agent ring timeout. Without this the queue rings an
+            // unanswered agent forever instead of moving on / running the
+            // fallback. On timeout the dial future is dropped, which cancels the
+            // pending INVITE to the agent.
+            let dial = self.try_single_target(agent, callee_state_rx, Some(Self::QUEUE_HOLD_TRACK_ID));
+            let result = match ring_timeout {
+                Some(timeout) => match tokio::time::timeout(timeout, dial).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        warn!(
+                            index = idx,
+                            timeout_secs = timeout.as_secs(),
+                            "Queue: agent ring timeout, no answer"
+                        );
+                        Err(into_callee_err(
+                            &StatusCode::RequestTimeout,
+                            Some("Agent ring timeout".to_string()),
+                        ))
+                    }
+                },
+                None => dial.await,
+            };
+
+            match result {
                 Ok(()) => {
                     info!(index = idx, "Queue: agent connected");
                     return Ok(());

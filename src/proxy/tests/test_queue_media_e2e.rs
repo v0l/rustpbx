@@ -26,8 +26,8 @@ use super::test_helpers::{build_sdp, pcma_sdp, pcmu_sdp};
 use super::test_ua::{TestUa, TestUaEvent};
 use crate::config::{MediaProxyMode, ProxyConfig};
 use crate::proxy::routing::{
-    MatchConditions, RouteAction, RouteQueueConfig, RouteQueueStrategyConfig,
-    RouteQueueTargetConfig, RouteRule,
+    MatchConditions, RouteAction, RouteQueueConfig, RouteQueueFallbackConfig,
+    RouteQueueStrategyConfig, RouteQueueTargetConfig, RouteRule,
 };
 use anyhow::{Result, anyhow};
 use rsipstack::dialog::DialogId;
@@ -457,6 +457,63 @@ async fn test_queue_early_answer_bidirectional_rtp() -> Result<()> {
     );
 
     ctx.caller_ua.hangup(&caller_id).await?;
+    ctx.server.stop();
+    Ok(())
+}
+
+/// When no agent answers within the queue's ring timeout, the queue MUST give
+/// up and run its fallback — it must not ring the agent forever. `execute_queue`
+/// originally ignored the ring timeout (`dial_queue_sequential` took an
+/// `_ring_timeout` it never used), so a no-answer call dialed indefinitely.
+#[tokio::test]
+async fn test_queue_no_answer_times_out_to_fallback() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Short 2s ring timeout + a hangup (486) fallback.
+    let mut config = queue_proxy_config_with(Vec::new(), false);
+    if let Some(q) = config.queues.get_mut("support") {
+        q.strategy.wait_timeout_secs = Some(2);
+        q.fallback = Some(RouteQueueFallbackConfig {
+            redirect: None,
+            failure_code: Some(486),
+            failure_reason: None,
+            failure_prompt: None,
+            queue_ref: None,
+            skill_group_ref: None,
+        });
+    }
+
+    let ctx = QueueMediaTestCtx::setup_with_config(config).await?;
+    let caller_sdp = pcmu_sdp("127.0.0.1", ctx.caller_receiver.port().unwrap());
+
+    // Caller dials the queue; the agent receives the INVITE but never answers.
+    let caller = Arc::new(ctx.caller_ua.clone());
+    let handle =
+        crate::utils::spawn(async move { caller.make_call("support", Some(caller_sdp)).await });
+
+    let mut agent_rang = false;
+    for _ in 0..50 {
+        let events = ctx.agent_ua.process_dialog_events().await?;
+        if events
+            .iter()
+            .any(|e| matches!(e, TestUaEvent::IncomingCall(..)))
+        {
+            agent_rang = true;
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(agent_rang, "agent never received the INVITE from the queue");
+
+    // With a 2s ring timeout the queue must give up; the caller call must
+    // resolve (fail with the fallback code) — NOT ring forever.
+    let res = tokio::time::timeout(Duration::from_secs(8), handle).await;
+    assert!(
+        res.is_ok(),
+        "caller call did not complete within 8s after a 2s ring timeout — \
+         the queue is dialing forever (ring_timeout not enforced)"
+    );
+
     ctx.server.stop();
     Ok(())
 }
