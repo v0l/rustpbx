@@ -102,16 +102,21 @@ gap is exactly what a node's `MediaPeer` wiring closes).
 `Fallback` `CalleeLeg`-style node that dials the trunk target via the same
 outbound-dial node code and bridges — identical machinery to a normal callee.
 
-**Status: implemented.** `FallbackPlan::DialBridge` makes exhaustion dial the
-fallback target as one more callee node (`NodeId::fallback()`), reusing the same
-dial → ring-timer → answer → bridge path. Proven by
-`test_queue_graph_fallback_dial_bridge` (primary never answers → fallback agent
-answers → two-way RTP). `FallbackPlan::Hangup(code)` covers explicit
-failure-code fallbacks. **Remaining:** the fallback target is resolved via the
-registrar locator (`resolve_custom_targets`), so registered/internal and
-external-realm URIs work; a **PSTN-via-trunk** fallback still needs the routing
-engine to attach a trunk destination to the fallback `Location` (follow-up).
-Re-queue / skill-group fallbacks are a clean busy in this version.
+**Status: implemented, incl. PSTN-via-trunk.** `FallbackPlan::DialBridge` makes
+exhaustion dial the fallback target as one more callee node
+(`NodeId::fallback()`), reusing the same dial → ring-timer → answer → bridge
+path. Two resolution strategies, chosen by whether the locator yields a
+concrete `destination`:
+* **Registered / internal / external-realm** → dialed directly from the
+  locator-resolved `Location`. Proven by `test_queue_graph_fallback_dial_bridge`.
+* **PSTN** (locator passes the URI through with `destination: None`) → routed
+  through the proxy's OUTBOUND routing (`match_invite`, `DialDirection::Outbound`)
+  so the matching trunk's destination is applied, then bridged. Proven by
+  `test_queue_graph_fallback_via_trunk` (gateway TestUa behind an outbound trunk
+  → two-way RTP).
+
+`FallbackPlan::Hangup(code)` covers explicit failure-code fallbacks. **Remaining:**
+re-queue / skill-group fallbacks are a clean busy in this version.
 
 Ringback: when the caller is neither answered immediately nor on hold music, a
 callee `180` relays a `RelayCallerRinging` effect so the caller hears ringback

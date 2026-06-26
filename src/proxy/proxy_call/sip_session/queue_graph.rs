@@ -19,6 +19,9 @@ use crate::call::graph::{
     FallbackPlan, GraphConfig, GraphEvent, GraphPhase, NodeId, PlayerKind, QueueBackend,
     QueueController, QueueGraph, Strategy,
 };
+use crate::call::{DialDirection, RoutingState};
+use crate::config::RouteResult;
+use crate::proxy::routing::matcher::{RouteResourceLookup, match_invite};
 use anyhow::Result;
 use async_trait::async_trait;
 use rsipstack::dialog::DialogId;
@@ -62,21 +65,27 @@ type Shared = Arc<Mutex<SharedDials>>;
 struct SipSessionQueueBackend<'a> {
     session: &'a mut SipSession,
     targets: Vec<crate::call::Location>,
+    /// Fallback targets pre-resolved via the registrar locator (internal /
+    /// registered / external-realm). Empty for a PSTN number.
     fallback_targets: Vec<crate::call::Location>,
+    /// Raw fallback URI, used to route via an outbound trunk when the locator
+    /// could not resolve it (e.g. a PSTN number that needs trunk selection).
+    fallback_uri: Option<String>,
+    /// The inbound INVITE, used as the `origin` for outbound trunk routing.
+    origin: rsipstack::sip::Request,
     dials: Shared,
     hold_audio: Option<String>,
     default_expires: u64,
 }
 
 impl SipSessionQueueBackend<'_> {
-    /// Shared dial path used by both candidate and fallback targets.
-    async fn do_dial(&mut self, node: &NodeId, target: &crate::call::Location) -> Result<()> {
-        let (option, callee_uri, _call_id) = self
-            .session
-            .build_target_invite_option(target, None)
-            .await
-            .map_err(|(c, t, _)| anyhow::anyhow!("build invite failed: {c} {t}"))?;
-
+    /// Issue an async INVITE for `option` and record the dial under `node`.
+    async fn invite_and_store(
+        &mut self,
+        node: &NodeId,
+        option: rsipstack::dialog::invitation::InviteOption,
+        callee_uri: rsipstack::sip::Uri,
+    ) -> Result<()> {
         let state_tx = self
             .session
             .callee_event_tx
@@ -108,6 +117,62 @@ impl SipSessionQueueBackend<'_> {
         );
         Ok(())
     }
+
+    /// Shared dial path used by both candidate and locator-resolved fallback.
+    async fn do_dial(&mut self, node: &NodeId, target: &crate::call::Location) -> Result<()> {
+        let (option, callee_uri, _call_id) = self
+            .session
+            .build_target_invite_option(target, None)
+            .await
+            .map_err(|(c, t, _)| anyhow::anyhow!("build invite failed: {c} {t}"))?;
+        self.invite_and_store(node, option, callee_uri).await
+    }
+
+    /// Dial a fallback URI by running it through the proxy's OUTBOUND routing so
+    /// a trunk destination (e.g. Twilio for a PSTN number) is applied, then
+    /// bridging it like any other callee leg.
+    async fn do_dial_via_trunk(&mut self, node: &NodeId, uri_str: &str) -> Result<()> {
+        let uri = rsipstack::sip::Uri::try_from(uri_str)
+            .map_err(|e| anyhow::anyhow!("bad fallback URI {uri_str}: {e}"))?;
+        let loc = crate::call::Location {
+            aor: uri,
+            ..Default::default()
+        };
+        let (option, _callee_uri, _call_id) = self
+            .session
+            .build_target_invite_option(&loc, None)
+            .await
+            .map_err(|(c, t, _)| anyhow::anyhow!("build fallback invite failed: {c} {t}"))?;
+
+        let dc = self.session.server.data_context.clone();
+        let trunks = dc.trunks_snapshot();
+        let routes = dc.routes_snapshot();
+        let result = match_invite(
+            if trunks.is_empty() { None } else { Some(&trunks) },
+            if routes.is_empty() { None } else { Some(&routes) },
+            Some(dc.as_ref() as &dyn RouteResourceLookup),
+            option,
+            &self.origin,
+            None,
+            Arc::new(RoutingState::new()),
+            &DialDirection::Outbound,
+        )
+        .await?;
+
+        match result {
+            RouteResult::Forward(routed, _) => {
+                let callee_uri = routed.callee.clone();
+                info!(%node, %callee_uri, "queue-graph: fallback routed via outbound trunk");
+                self.invite_and_store(node, routed, callee_uri).await
+            }
+            RouteResult::Abort(code, reason) => {
+                Err(anyhow::anyhow!("fallback routing aborted: {code} {reason:?}"))
+            }
+            _ => Err(anyhow::anyhow!(
+                "fallback target {uri_str} not routable to a trunk"
+            )),
+        }
+    }
 }
 
 #[async_trait]
@@ -122,13 +187,17 @@ impl QueueBackend for SipSessionQueueBackend<'_> {
     }
 
     async fn dial_fallback(&mut self, node: &NodeId) -> Result<()> {
-        let target = self
-            .fallback_targets
-            .first()
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("no reachable fallback target"))?;
-        info!(%node, "queue-graph: dialing fallback target");
-        self.do_dial(node, &target).await
+        // Prefer a locator-resolved target (internal / registered / external
+        // realm); otherwise route the raw URI via an outbound trunk (PSTN).
+        if let Some(target) = self.fallback_targets.first().cloned() {
+            info!(%node, "queue-graph: dialing fallback target (locator)");
+            return self.do_dial(node, &target).await;
+        }
+        if let Some(uri) = self.fallback_uri.clone() {
+            info!(%node, %uri, "queue-graph: dialing fallback target (trunk)");
+            return self.do_dial_via_trunk(node, &uri).await;
+        }
+        Err(anyhow::anyhow!("no reachable fallback target"))
     }
 
     async fn relay_caller_ringing(&mut self) {
@@ -377,7 +446,7 @@ impl SipSession {
         // leg; an explicit failure becomes a clean hangup; everything else
         // (re-queue, skill-group) is a busy hangup in this version.
         let (fallback_plan, fallback_uri) = self.resolve_queue_fallback(plan);
-        let fallback_targets = match fallback_uri {
+        let fallback_targets = match &fallback_uri {
             Some(uri_str) => match rsipstack::sip::Uri::try_from(uri_str.as_str()) {
                 Ok(uri) => {
                     let loc = crate::call::Location {
@@ -392,6 +461,18 @@ impl SipSession {
                 }
             },
             None => Vec::new(),
+        };
+
+        // Decide how the fallback gets dialed: a locator-resolved target has a
+        // concrete `destination` (registered contact) and is dialed directly;
+        // otherwise the raw URI is routed through an outbound trunk (PSTN). A
+        // plain external URI passes through `resolve_custom_targets` as a bare
+        // location with `destination: None`, which is exactly the trunk case.
+        let fallback_registered = fallback_targets.iter().any(|l| l.destination.is_some());
+        let (fallback_targets, fallback_uri) = if fallback_registered {
+            (fallback_targets, None)
+        } else {
+            (Vec::new(), fallback_uri)
         };
 
         let config = GraphConfig {
@@ -411,10 +492,13 @@ impl SipSession {
 
         let dials: Shared = Arc::new(Mutex::new(SharedDials::default()));
 
+        let origin = self.server_dialog.initial_request().clone();
         let backend = SipSessionQueueBackend {
             session: self,
             targets,
             fallback_targets,
+            fallback_uri,
+            origin,
             dials: dials.clone(),
             hold_audio,
             default_expires,

@@ -26,9 +26,10 @@ use super::test_helpers::{build_sdp, pcma_sdp, pcmu_sdp};
 use super::test_ua::{TestUa, TestUaEvent};
 use crate::config::{MediaProxyMode, ProxyConfig};
 use crate::proxy::routing::{
-    MatchConditions, RouteAction, RouteQueueConfig, RouteQueueFallbackConfig,
-    RouteQueueStrategyConfig, RouteQueueTargetConfig, RouteRule,
+    DestConfig, MatchConditions, RouteAction, RouteQueueConfig, RouteQueueFallbackConfig,
+    RouteQueueStrategyConfig, RouteQueueTargetConfig, RouteRule, TrunkConfig, TrunkDirection,
 };
+use super::test_ua::TestUaConfig;
 use anyhow::{Result, anyhow};
 use rsipstack::dialog::DialogId;
 use std::net::SocketAddr;
@@ -574,6 +575,152 @@ async fn test_queue_graph_bidirectional_rtp() -> Result<()> {
     assert!(
         caller_stats.packets_received > 0,
         "caller should receive RTP from agent through the call-graph bridge (got 0)"
+    );
+
+    ctx.caller_ua.hangup(&caller_id).await?;
+    ctx.server.stop();
+    Ok(())
+}
+
+/// Call-graph engine: PSTN-style fallback via an OUTBOUND TRUNK. The primary
+/// target never answers; the fallback is a number that the locator can't
+/// resolve, so it is routed through a configured outbound trunk (here a gateway
+/// TestUa standing in for the PSTN carrier) and bridged. Proves the
+/// dial+bridge fallback reuses the proxy's outbound routing (match_invite).
+#[tokio::test]
+async fn test_queue_graph_fallback_via_trunk() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // The gateway listens on a fixed port so the trunk `dest` can point at it.
+    let gw_port = portpicker::pick_unused_port().expect("a free port for the gateway");
+
+    let mut config = queue_graph_config_with(Vec::new(), false);
+    if let Some(q) = config.queues.get_mut("support") {
+        q.strategy.wait_timeout_secs = Some(2);
+        q.fallback = Some(RouteQueueFallbackConfig {
+            redirect: Some("sip:5559999@127.0.0.1".to_string()),
+            failure_code: None,
+            failure_reason: None,
+            failure_prompt: None,
+            queue_ref: None,
+            skill_group_ref: None,
+        });
+    }
+    // Outbound trunk pointing at the gateway UA + a route that sends the
+    // fallback number to it.
+    config.trunks.insert(
+        "testgw".to_string(),
+        TrunkConfig {
+            dest: format!("sip:127.0.0.1:{gw_port}"),
+            direction: Some(TrunkDirection::Outbound),
+            ..Default::default()
+        },
+    );
+    if let Some(routes) = config.routes.as_mut() {
+        routes.push(RouteRule {
+            name: "out_to_gw".to_string(),
+            priority: 20,
+            match_conditions: MatchConditions {
+                to_user: Some("5559999".to_string()),
+                ..Default::default()
+            },
+            action: RouteAction {
+                dest: Some(DestConfig::Single("testgw".to_string())),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    }
+
+    let ctx = QueueMediaTestCtx::setup_with_config(config).await?;
+
+    // Bring up the gateway UA on the fixed port (no registration needed — the
+    // trunk dials it by address).
+    let mut gw_ua = TestUa::new(TestUaConfig {
+        username: "gw".to_string(),
+        password: "x".to_string(),
+        realm: "127.0.0.1".to_string(),
+        local_port: gw_port,
+        proxy_addr: ctx.server.proxy_addr,
+    });
+    gw_ua.start().await?;
+    let gw_sender = RtpSender::bind().await?;
+    let gw_receiver = RtpReceiver::bind(0).await?;
+    sleep(Duration::from_millis(100)).await;
+
+    let caller_sdp = pcmu_sdp("127.0.0.1", ctx.caller_receiver.port().unwrap());
+    let gw_sdp = pcmu_sdp("127.0.0.1", gw_receiver.port().unwrap());
+
+    let caller = Arc::new(ctx.caller_ua.clone());
+    let caller_sdp_cl = caller_sdp.clone();
+    let caller_handle = crate::utils::spawn(async move {
+        caller.make_call("support", Some(caller_sdp_cl)).await
+    });
+
+    // bob rings but never answers; the gateway (via trunk) answers the fallback.
+    let mut gw_call: Option<(DialogId, String)> = None;
+    for _ in 0..120 {
+        let _ = ctx.agent_ua.process_dialog_events().await?;
+        for event in gw_ua.process_dialog_events().await? {
+            if let TestUaEvent::IncomingCall(id, offer) = event {
+                gw_ua.answer_call(&id, Some(gw_sdp.clone())).await?;
+                info!("trunk gateway answered fallback");
+                gw_call = Some((id, offer.unwrap_or_default()));
+                break;
+            }
+        }
+        if gw_call.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    let (_gw_id, gw_offer) =
+        gw_call.ok_or_else(|| anyhow!("trunk gateway never received the fallback INVITE"))?;
+
+    let caller_id = tokio::time::timeout(Duration::from_secs(8), caller_handle)
+        .await
+        .map_err(|_| anyhow!("caller timed out waiting for trunk fallback connect"))?
+        .map_err(|e| anyhow!("caller task join error: {e}"))?
+        .map_err(|e| anyhow!("trunk fallback call failed: {e}"))?;
+    info!(%caller_id, "caller connected to trunk gateway via fallback");
+
+    let caller_answer_sdp = ctx
+        .caller_ua
+        .get_negotiated_answer_sdp(&caller_id)
+        .await
+        .ok_or_else(|| anyhow!("No answer SDP on caller side"))?;
+    let gw_target = extract_media_endpoint(&gw_offer)
+        .ok_or_else(|| anyhow!("Failed to parse gateway endpoint"))?;
+    let caller_target = extract_media_endpoint(&caller_answer_sdp)
+        .ok_or_else(|| anyhow!("Failed to parse caller endpoint"))?;
+
+    use super::rtp_utils::RtpPacket;
+    ctx.caller_receiver.start_receiving();
+    gw_receiver.start_receiving();
+    let caller_pkts = RtpPacket::create_sequence(100, 1000, 50000, 0xA1A1A1A1, 0, 160, 160);
+    let gw_pkts = RtpPacket::create_sequence(100, 2000, 60000, 0xD4D4D4D4, 0, 160, 160);
+    ctx.caller_sender.start_sending(gw_target, caller_pkts, 20);
+    gw_sender.start_sending(caller_target, gw_pkts, 20);
+    sleep(Duration::from_millis(2500)).await;
+    ctx.caller_sender.stop();
+    gw_sender.stop();
+    sleep(Duration::from_millis(200)).await;
+
+    let caller_stats = ctx.caller_receiver.get_stats().await;
+    let gw_stats = gw_receiver.get_stats().await;
+    info!(
+        caller_received = caller_stats.packets_received,
+        gw_received = gw_stats.packets_received,
+        "trunk fallback RTP exchange complete"
+    );
+
+    assert!(
+        gw_stats.packets_received > 0,
+        "trunk gateway should receive RTP from caller (got 0)"
+    );
+    assert!(
+        caller_stats.packets_received > 0,
+        "caller should receive RTP from the trunk gateway (got 0)"
     );
 
     ctx.caller_ua.hangup(&caller_id).await?;
