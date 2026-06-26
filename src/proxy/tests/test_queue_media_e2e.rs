@@ -93,6 +93,16 @@ fn queue_proxy_config_with(audio_codecs: Vec<String>, accept_immediately: bool) 
     config
 }
 
+/// Same as [`queue_proxy_config_with`], but routes the queue through the
+/// event-driven call-graph controller (`queue_graph_engine = true`). Used by the
+/// `test_queue_graph_*` tests to A/B the parallel engine against the imperative
+/// `execute_queue` path the other tests exercise.
+fn queue_graph_config_with(audio_codecs: Vec<String>, accept_immediately: bool) -> ProxyConfig {
+    let mut config = queue_proxy_config_with(audio_codecs, accept_immediately);
+    config.queue_graph_engine = true;
+    config
+}
+
 struct QueueMediaTestCtx {
     server: Arc<E2eTestServer>,
     caller_ua: TestUa,
@@ -514,6 +524,278 @@ async fn test_queue_no_answer_times_out_to_fallback() -> Result<()> {
          the queue is dialing forever (ring_timeout not enforced)"
     );
 
+    ctx.server.stop();
+    Ok(())
+}
+
+// =============================================================================
+// Parallel engine (`queue_graph_engine = true`) — the call-graph controller.
+// These mirror the key imperative-path tests above to prove parity.
+// =============================================================================
+
+/// Call-graph engine: a queue call answered by an agent must have working
+/// bidirectional RTP through the anchored proxy bridge.
+#[tokio::test]
+async fn test_queue_graph_bidirectional_rtp() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let ctx =
+        QueueMediaTestCtx::setup_with_config(queue_graph_config_with(Vec::new(), false)).await?;
+
+    let caller_sdp = pcmu_sdp("127.0.0.1", ctx.caller_receiver.port().unwrap());
+    let agent_sdp = pcmu_sdp("127.0.0.1", ctx.agent_receiver.port().unwrap());
+
+    let (caller_id, _agent_id, agent_offer) =
+        ctx.establish_queue_call(caller_sdp, agent_sdp).await?;
+    info!(%caller_id, "call-graph queue connected to agent");
+
+    let caller_answer_sdp = ctx
+        .caller_ua
+        .get_negotiated_answer_sdp(&caller_id)
+        .await
+        .ok_or_else(|| anyhow!("No answer SDP on caller side"))?;
+    let agent_target = extract_media_endpoint(&agent_offer)
+        .ok_or_else(|| anyhow!("Failed to parse agent-side endpoint"))?;
+    let caller_target = extract_media_endpoint(&caller_answer_sdp)
+        .ok_or_else(|| anyhow!("Failed to parse caller-side endpoint"))?;
+
+    let (caller_stats, agent_stats) =
+        ctx.exchange_rtp(caller_target, agent_target, 0, 2000).await?;
+    info!(
+        caller_received = caller_stats.packets_received,
+        agent_received = agent_stats.packets_received,
+        "call-graph queue RTP exchange complete"
+    );
+
+    assert!(
+        agent_stats.packets_received > 0,
+        "agent should receive RTP from caller through the call-graph bridge (got 0)"
+    );
+    assert!(
+        caller_stats.packets_received > 0,
+        "caller should receive RTP from agent through the call-graph bridge (got 0)"
+    );
+
+    ctx.caller_ua.hangup(&caller_id).await?;
+    ctx.server.stop();
+    Ok(())
+}
+
+/// Call-graph engine: caller hangup must cascade and tear down the agent leg.
+/// This is THE prod bug ("caller hangs up but agent keeps ringing/connected")
+/// the event-driven controller is designed to fix structurally.
+#[tokio::test]
+async fn test_queue_graph_caller_hangup_ends_agent_call() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let ctx =
+        QueueMediaTestCtx::setup_with_config(queue_graph_config_with(Vec::new(), false)).await?;
+    let caller_sdp = pcmu_sdp("127.0.0.1", ctx.caller_receiver.port().unwrap());
+    let agent_sdp = pcmu_sdp("127.0.0.1", ctx.agent_receiver.port().unwrap());
+
+    let (caller_id, agent_id, _agent_offer) =
+        ctx.establish_queue_call(caller_sdp, agent_sdp).await?;
+    info!(%caller_id, %agent_id, "call-graph queue connected; caller will hang up");
+
+    ctx.caller_ua.hangup(&caller_id).await?;
+
+    for _ in 0..50 {
+        let events = ctx.agent_ua.process_dialog_events().await?;
+        if events
+            .iter()
+            .any(|e| matches!(e, TestUaEvent::CallTerminated(id) if id == &agent_id))
+        {
+            info!("agent call terminated after caller hangup (call-graph cascade OK)");
+            ctx.server.stop();
+            return Ok(());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    Err(anyhow!(
+        "call-graph: agent call did not terminate after caller hung up"
+    ))
+}
+
+/// Call-graph engine: agent hangup must cascade to the caller.
+#[tokio::test]
+async fn test_queue_graph_agent_hangup_ends_caller_call() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let ctx =
+        QueueMediaTestCtx::setup_with_config(queue_graph_config_with(Vec::new(), false)).await?;
+    let caller_sdp = pcmu_sdp("127.0.0.1", ctx.caller_receiver.port().unwrap());
+    let agent_sdp = pcmu_sdp("127.0.0.1", ctx.agent_receiver.port().unwrap());
+
+    let (caller_id, agent_id, _agent_offer) =
+        ctx.establish_queue_call(caller_sdp, agent_sdp).await?;
+    info!(%caller_id, %agent_id, "call-graph queue connected; agent will hang up");
+
+    ctx.agent_ua.hangup(&agent_id).await?;
+    ctx.wait_for_caller_terminated(&caller_id, 5).await?;
+    info!("caller terminated after agent hangup (call-graph cascade OK)");
+
+    ctx.server.stop();
+    Ok(())
+}
+
+/// Call-graph engine: an unanswered agent must time out to fallback rather than
+/// ring forever (ring timeout enforced by the controller's own timer).
+#[tokio::test]
+async fn test_queue_graph_no_answer_times_out() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let mut config = queue_graph_config_with(Vec::new(), false);
+    if let Some(q) = config.queues.get_mut("support") {
+        q.strategy.wait_timeout_secs = Some(2);
+        q.fallback = Some(RouteQueueFallbackConfig {
+            redirect: None,
+            failure_code: Some(486),
+            failure_reason: None,
+            failure_prompt: None,
+            queue_ref: None,
+            skill_group_ref: None,
+        });
+    }
+
+    let ctx = QueueMediaTestCtx::setup_with_config(config).await?;
+    let caller_sdp = pcmu_sdp("127.0.0.1", ctx.caller_receiver.port().unwrap());
+
+    let caller = Arc::new(ctx.caller_ua.clone());
+    let handle =
+        crate::utils::spawn(async move { caller.make_call("support", Some(caller_sdp)).await });
+
+    let mut agent_rang = false;
+    for _ in 0..50 {
+        let events = ctx.agent_ua.process_dialog_events().await?;
+        if events
+            .iter()
+            .any(|e| matches!(e, TestUaEvent::IncomingCall(..)))
+        {
+            agent_rang = true;
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(agent_rang, "agent never received the INVITE from the call-graph queue");
+
+    let res = tokio::time::timeout(Duration::from_secs(8), handle).await;
+    assert!(
+        res.is_ok(),
+        "call-graph: caller call did not complete within 8s after a 2s ring timeout"
+    );
+
+    ctx.server.stop();
+    Ok(())
+}
+
+/// Call-graph engine: dial+bridge fallback. The primary target (bob) never
+/// answers; after the ring timeout the queue dials the configured fallback
+/// target (charlie), who answers, and the caller gets two-way audio with charlie.
+/// This proves the fallback is a real dial+bridge — not a REFER and not a busy.
+#[tokio::test]
+async fn test_queue_graph_fallback_dial_bridge() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // support → dial bob (won't answer), 2s ring timeout, fallback = redirect
+    // to charlie (a second registered agent).
+    let mut config = queue_graph_config_with(Vec::new(), false);
+    if let Some(q) = config.queues.get_mut("support") {
+        q.strategy.wait_timeout_secs = Some(2);
+        q.fallback = Some(RouteQueueFallbackConfig {
+            redirect: Some("sip:charlie@127.0.0.1".to_string()),
+            failure_code: None,
+            failure_reason: None,
+            failure_prompt: None,
+            queue_ref: None,
+            skill_group_ref: None,
+        });
+    }
+
+    let ctx = QueueMediaTestCtx::setup_with_config(config).await?;
+    // Register the fallback agent + its RTP endpoints.
+    let charlie_ua = ctx.server.create_ua("charlie").await?;
+    let charlie_sender = RtpSender::bind().await?;
+    let charlie_receiver = RtpReceiver::bind(0).await?;
+    sleep(Duration::from_millis(100)).await;
+
+    let caller_sdp = pcmu_sdp("127.0.0.1", ctx.caller_receiver.port().unwrap());
+    let charlie_sdp = pcmu_sdp("127.0.0.1", charlie_receiver.port().unwrap());
+
+    let caller = Arc::new(ctx.caller_ua.clone());
+    let caller_sdp_cl = caller_sdp.clone();
+    let caller_handle = crate::utils::spawn(async move {
+        caller.make_call("support", Some(caller_sdp_cl)).await
+    });
+
+    // bob rings but never answers; charlie (fallback) answers when dialed.
+    let mut charlie_call: Option<(DialogId, String)> = None;
+    for _ in 0..120 {
+        // Drain bob's events without answering so it just rings.
+        let _ = ctx.agent_ua.process_dialog_events().await?;
+        for event in charlie_ua.process_dialog_events().await? {
+            if let TestUaEvent::IncomingCall(id, offer) = event {
+                charlie_ua.answer_call(&id, Some(charlie_sdp.clone())).await?;
+                info!("fallback agent (charlie) answered");
+                charlie_call = Some((id, offer.unwrap_or_default()));
+                break;
+            }
+        }
+        if charlie_call.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    let (_charlie_id, charlie_offer) =
+        charlie_call.ok_or_else(|| anyhow!("fallback agent (charlie) never received INVITE"))?;
+
+    let caller_id = tokio::time::timeout(Duration::from_secs(8), caller_handle)
+        .await
+        .map_err(|_| anyhow!("caller timed out waiting for fallback connect"))?
+        .map_err(|e| anyhow!("caller task join error: {e}"))?
+        .map_err(|e| anyhow!("fallback queue call failed: {e}"))?;
+    info!(%caller_id, "caller connected to fallback agent");
+
+    let caller_answer_sdp = ctx
+        .caller_ua
+        .get_negotiated_answer_sdp(&caller_id)
+        .await
+        .ok_or_else(|| anyhow!("No answer SDP on caller side"))?;
+    let charlie_target = extract_media_endpoint(&charlie_offer)
+        .ok_or_else(|| anyhow!("Failed to parse fallback agent endpoint"))?;
+    let caller_target = extract_media_endpoint(&caller_answer_sdp)
+        .ok_or_else(|| anyhow!("Failed to parse caller endpoint"))?;
+
+    // Exchange RTP between caller and the fallback agent (charlie).
+    use super::rtp_utils::RtpPacket;
+    ctx.caller_receiver.start_receiving();
+    charlie_receiver.start_receiving();
+    let caller_pkts = RtpPacket::create_sequence(100, 1000, 50000, 0xA1A1A1A1, 0, 160, 160);
+    let charlie_pkts = RtpPacket::create_sequence(100, 2000, 60000, 0xC3C3C3C3, 0, 160, 160);
+    ctx.caller_sender.start_sending(charlie_target, caller_pkts, 20);
+    charlie_sender.start_sending(caller_target, charlie_pkts, 20);
+    sleep(Duration::from_millis(2500)).await;
+    ctx.caller_sender.stop();
+    charlie_sender.stop();
+    sleep(Duration::from_millis(200)).await;
+
+    let caller_stats = ctx.caller_receiver.get_stats().await;
+    let charlie_stats = charlie_receiver.get_stats().await;
+    info!(
+        caller_received = caller_stats.packets_received,
+        charlie_received = charlie_stats.packets_received,
+        "fallback dial+bridge RTP exchange complete"
+    );
+
+    assert!(
+        charlie_stats.packets_received > 0,
+        "fallback agent should receive RTP from caller (got 0)"
+    );
+    assert!(
+        caller_stats.packets_received > 0,
+        "caller should receive RTP from the fallback agent (got 0)"
+    );
+
+    ctx.caller_ua.hangup(&caller_id).await?;
     ctx.server.stop();
     Ok(())
 }

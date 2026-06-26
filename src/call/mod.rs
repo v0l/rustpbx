@@ -22,6 +22,7 @@ pub mod adapters;
 pub mod app;
 pub mod cookie;
 pub mod domain;
+pub mod graph;
 pub mod policy;
 pub mod queue_config;
 pub mod runtime;

@@ -101,6 +101,7 @@ use tracing::{debug, error, info, warn};
 
 mod conference;
 mod queue;
+mod queue_graph;
 mod supervisor;
 mod transfer;
 
@@ -2018,10 +2019,30 @@ impl SipSession {
             }
         }
 
-        if !self.context.dialplan.is_empty()
-            && let Err((status_code, text, reason)) =
-                self.execute_dialplan(&mut callee_state_rx).await
-        {
+        // Parallel queue engine (opt-in): when enabled and the flow is a queue,
+        // run the event-driven call-graph controller instead of the imperative
+        // `execute_queue`. It owns BOTH the caller and callee state channels so
+        // caller hangup / reject / ring-timeout are first-class events rather
+        // than polled. Any other flow falls through to the existing path.
+        let queue_graph_plan = if self.server.proxy_config.queue_graph_engine {
+            match &self.context.dialplan.flow {
+                crate::call::DialplanFlow::Queue { plan, .. } => Some(plan.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let dialplan_result = if let Some(plan) = queue_graph_plan {
+            self.run_queue_graph(&plan, &mut state_rx, &mut callee_state_rx)
+                .await
+        } else if !self.context.dialplan.is_empty() {
+            self.execute_dialplan(&mut callee_state_rx).await
+        } else {
+            Ok(())
+        };
+
+        if let Err((status_code, text, reason)) = dialplan_result {
             warn!(session_id = %self.context.session_id, ?status_code, ?text, ?reason, "Dialplan execution failed");
 
             if matches!(status_code, 408 | 480 | 486 | 487) {}
