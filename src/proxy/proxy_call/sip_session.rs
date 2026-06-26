@@ -6979,10 +6979,18 @@ impl SipSession {
 
         let fallback = Path::new("config").join(audio_file);
         if fallback.exists() {
-            fallback.to_string_lossy().to_string()
-        } else {
-            audio_file.to_string()
+            return fallback.to_string_lossy().to_string();
         }
+
+        // Bare filename (e.g. "anna_busy.mp3") or "sounds/x" that wasn't found
+        // above: the queue UI stores uploaded sounds under config/sounds, so
+        // try there before giving up.
+        let in_sounds = Path::new("config/sounds").join(audio_file);
+        if in_sounds.exists() {
+            return in_sounds.to_string_lossy().to_string();
+        }
+
+        audio_file.to_string()
     }
 
     pub async fn start_recording(
