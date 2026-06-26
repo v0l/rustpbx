@@ -681,9 +681,17 @@ impl SipSession {
                 let c = code.as_ref().map(|s| s.code()).unwrap_or(486);
                 (FallbackPlan::Hangup(c), None)
             }
-            // Play-then-hangup, transfer-to-queue/IVR, re-enqueue and
-            // skill-group are delegated to execute_queue_fallback (which already
-            // plays prompts and runs those actions).
+            // Skill-group fallback: resolve to agent locations and dial+bridge
+            // (like a primary skill-group target) rather than the legacy REFER
+            // (`handle_blind_transfer`) path — robust for contact-center.
+            // `resolve_custom_targets` already expands `skill-group:` via the
+            // AgentRegistry, so we route it through the DialBridge fallback.
+            Some(QueueFallbackAction::Queue { name }) if name.starts_with("skill-group:") => {
+                (FallbackPlan::DialBridge, Some(name.clone()))
+            }
+            // Play-then-hangup, transfer-to-queue/IVR and queue re-enqueue are
+            // delegated to execute_queue_fallback (which plays prompts and runs
+            // those actions — none of which use the fragile REFER path).
             Some(QueueFallbackAction::Failure(FailureAction::PlayThenHangup { .. })) => {
                 (FallbackPlan::Delegate, None)
             }

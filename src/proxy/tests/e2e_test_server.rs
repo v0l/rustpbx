@@ -99,7 +99,18 @@ impl E2eTestServer {
     }
 
     /// Start with a custom ProxyConfig, allowing injection of trunks, routes, etc.
-    pub async fn start_with_config(mut proxy_config: ProxyConfig) -> Result<Self> {
+    pub async fn start_with_config(proxy_config: ProxyConfig) -> Result<Self> {
+        Self::start_with_config_and_registry(proxy_config, None).await
+    }
+
+    /// Like [`start_with_config`], but also injects an `AgentRegistry` so tests
+    /// can exercise skill-group resolution.
+    pub async fn start_with_config_and_registry(
+        mut proxy_config: ProxyConfig,
+        agent_registry: Option<
+            std::sync::Arc<dyn crate::call::app::agent_registry::AgentRegistry>,
+        >,
+    ) -> Result<Self> {
         let port = portpicker::pick_unused_port().unwrap_or(15060);
         let proxy_addr = format!("127.0.0.1:{}", port).parse()?;
 
@@ -128,13 +139,15 @@ impl E2eTestServer {
         let locator = MemoryLocator::new();
         let cancel_token = CancellationToken::new();
 
-        let builder = test_helpers::register_standard_modules(
-            SipServerBuilder::new(config)
-                .with_user_backend(Box::new(user_backend))
-                .with_locator(Box::new(locator))
-                .with_cancel_token(cancel_token.clone())
-                .with_callrecord_sender(Some(cdr_sender)),
-        );
+        let mut server_builder = SipServerBuilder::new(config)
+            .with_user_backend(Box::new(user_backend))
+            .with_locator(Box::new(locator))
+            .with_cancel_token(cancel_token.clone())
+            .with_callrecord_sender(Some(cdr_sender));
+        if let Some(registry) = agent_registry {
+            server_builder = server_builder.with_agent_registry(registry);
+        }
+        let builder = test_helpers::register_standard_modules(server_builder);
 
         let server = Arc::new(builder.build().await?);
         let server_ref = server.get_inner();

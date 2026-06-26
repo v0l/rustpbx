@@ -164,9 +164,9 @@ and the `QueuePlan` surface. ✓ = parity, ↑ = call-graph is strictly better,
 | `Failure(Hangup{code})` | ✓ | ✓ (`Hangup`) |
 | `Redirect` / `Transfer(Uri)` incl. PSTN | △ REFER (**broken for Twilio/PSTN**) | ↑ dial+bridge, trunk-routed |
 | `Failure(PlayThenHangup)` | ✓ | ✓ via `Delegate` → `execute_queue_fallback` |
-| `Transfer(Queue)` re-enqueue | ✓ | ✓ via `Delegate` |
-| `Transfer(Ivr)` | ✓ | ✓ via `Delegate` |
-| `Queue{skill-group}` | ✓ | ✓ via `Delegate` |
+| `Transfer(Queue)` re-enqueue | ✓ | ✓ via `Delegate` (not REFER) |
+| `Transfer(Ivr)` | ✓ | ✓ via `Delegate` (not REFER) |
+| `Queue{skill-group}` | △ REFER (`handle_blind_transfer`) | ↑ **dial+bridge** (resolve via AgentRegistry → DialBridge) |
 | default (none) → busy | ✓ | ✓ |
 
 ### Edge cases / cosmetic
@@ -187,6 +187,12 @@ playback, and prompt extensibility. Remaining true gaps (all minor, tracked):
 2. Edge semantics: no-`dial_strategy` and zero-targets differ slightly.
 3. `label`-as-snapshot-name not carried.
 4. 183 early-media passthrough — absent in both; a genuine future want.
+
+Note: skill-group **fallback** now uses dial+bridge (was REFER), matching the
+robust path skill-group **primary** routing already used — the only
+contact-center fallback that was REFER-fragile. `Transfer(Queue)` (re-enqueue)
+and `Transfer(Ivr)` legitimately stay on `Delegate` (queue re-entry / IVR app,
+neither REFER-based).
 
 Ringback: when the caller is neither answered immediately nor on hold music, a
 callee `180` relays a `RelayCallerRinging` effect so the caller hears ringback

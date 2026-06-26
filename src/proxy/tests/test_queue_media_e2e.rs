@@ -728,6 +728,187 @@ async fn test_queue_graph_fallback_via_trunk() -> Result<()> {
     Ok(())
 }
 
+/// Minimal AgentRegistry that resolves any `skill-group:*` target to one fixed
+/// agent URI — enough to exercise skill-group fallback resolution.
+struct SkillRegistry {
+    agent_uri: String,
+}
+
+#[async_trait::async_trait]
+impl crate::call::app::agent_registry::AgentRegistry for SkillRegistry {
+    async fn register(
+        &self,
+        _: String,
+        _: String,
+        _: String,
+        _: Vec<String>,
+        _: u32,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn unregister(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn get_agent(
+        &self,
+        _: &str,
+    ) -> Option<crate::call::app::agent_registry::AgentRecord> {
+        None
+    }
+    async fn list_agents(&self) -> Vec<crate::call::app::agent_registry::AgentRecord> {
+        vec![]
+    }
+    async fn update_presence(
+        &self,
+        _: &str,
+        _: crate::call::app::agent_registry::PresenceState,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn start_call(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn end_call(&self, _: &str, _: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn find_available_agents(
+        &self,
+        _: &[String],
+    ) -> Vec<crate::call::app::agent_registry::AgentRecord> {
+        vec![]
+    }
+    async fn select_agent(
+        &self,
+        _: &[String],
+        _: crate::call::app::agent_registry::RoutingStrategy,
+    ) -> Option<crate::call::app::agent_registry::AgentRecord> {
+        None
+    }
+    async fn resolve_target(&self, target_uri: &str) -> Vec<String> {
+        if target_uri.starts_with("skill-group:") {
+            vec![self.agent_uri.clone()]
+        } else {
+            vec![]
+        }
+    }
+}
+
+/// Call-graph engine: **skill-group fallback via dial+bridge**. The primary
+/// target never answers; the fallback is a skill group that the AgentRegistry
+/// resolves to a registered agent, which is then dialed+bridged (not REFER'd).
+/// This is the robust contact-center fallback path.
+#[tokio::test]
+async fn test_queue_graph_skillgroup_fallback_dial_bridge() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let mut config = queue_graph_config_with(Vec::new(), false);
+    if let Some(q) = config.queues.get_mut("support") {
+        q.strategy.wait_timeout_secs = Some(2);
+        q.fallback = Some(RouteQueueFallbackConfig {
+            redirect: None,
+            failure_code: None,
+            failure_reason: None,
+            failure_prompt: None,
+            queue_ref: None,
+            skill_group_ref: Some("agents".to_string()),
+        });
+    }
+
+    // The skill group resolves to charlie (a registered standard test user).
+    let registry = Arc::new(SkillRegistry {
+        agent_uri: "sip:charlie@127.0.0.1".to_string(),
+    });
+    let server = Arc::new(
+        E2eTestServer::start_with_config_and_registry(config, Some(registry)).await?,
+    );
+    let caller_ua = server.create_ua("alice").await?;
+    let _bob = server.create_ua("bob").await?; // primary target, never answers
+    let charlie_ua = server.create_ua("charlie").await?; // skill-group agent
+    sleep(Duration::from_millis(150)).await;
+
+    let caller_receiver = RtpReceiver::bind(0).await?;
+    let caller_sender = RtpSender::bind().await?;
+    let charlie_receiver = RtpReceiver::bind(0).await?;
+    let charlie_sender = RtpSender::bind().await?;
+
+    let caller_sdp = pcmu_sdp("127.0.0.1", caller_receiver.port().unwrap());
+    let charlie_sdp = pcmu_sdp("127.0.0.1", charlie_receiver.port().unwrap());
+
+    let caller = Arc::new(caller_ua.clone());
+    let caller_sdp_cl = caller_sdp.clone();
+    let caller_handle = crate::utils::spawn(async move {
+        caller.make_call("support", Some(caller_sdp_cl)).await
+    });
+
+    // bob rings but never answers; charlie (skill-group fallback) answers.
+    let mut charlie_call: Option<(DialogId, String)> = None;
+    for _ in 0..120 {
+        for event in charlie_ua.process_dialog_events().await? {
+            if let TestUaEvent::IncomingCall(id, offer) = event {
+                charlie_ua.answer_call(&id, Some(charlie_sdp.clone())).await?;
+                info!("skill-group agent (charlie) answered fallback");
+                charlie_call = Some((id, offer.unwrap_or_default()));
+                break;
+            }
+        }
+        if charlie_call.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    let (_charlie_id, charlie_offer) = charlie_call
+        .ok_or_else(|| anyhow!("skill-group agent never received the fallback INVITE"))?;
+
+    let caller_id = tokio::time::timeout(Duration::from_secs(8), caller_handle)
+        .await
+        .map_err(|_| anyhow!("caller timed out waiting for skill-group fallback"))?
+        .map_err(|e| anyhow!("caller task join error: {e}"))?
+        .map_err(|e| anyhow!("skill-group fallback call failed: {e}"))?;
+    info!(%caller_id, "caller connected to skill-group agent via fallback");
+
+    let caller_answer_sdp = caller_ua
+        .get_negotiated_answer_sdp(&caller_id)
+        .await
+        .ok_or_else(|| anyhow!("No answer SDP on caller side"))?;
+    let charlie_target = extract_media_endpoint(&charlie_offer)
+        .ok_or_else(|| anyhow!("Failed to parse skill-group agent endpoint"))?;
+    let caller_target = extract_media_endpoint(&caller_answer_sdp)
+        .ok_or_else(|| anyhow!("Failed to parse caller endpoint"))?;
+
+    use super::rtp_utils::RtpPacket;
+    caller_receiver.start_receiving();
+    charlie_receiver.start_receiving();
+    let caller_pkts = RtpPacket::create_sequence(100, 1000, 50000, 0xA1A1A1A1, 0, 160, 160);
+    let charlie_pkts = RtpPacket::create_sequence(100, 2000, 60000, 0xE5E5E5E5, 0, 160, 160);
+    caller_sender.start_sending(charlie_target, caller_pkts, 20);
+    charlie_sender.start_sending(caller_target, charlie_pkts, 20);
+    sleep(Duration::from_millis(2500)).await;
+    caller_sender.stop();
+    charlie_sender.stop();
+    sleep(Duration::from_millis(200)).await;
+
+    let caller_stats = caller_receiver.get_stats().await;
+    let charlie_stats = charlie_receiver.get_stats().await;
+    info!(
+        caller_received = caller_stats.packets_received,
+        charlie_received = charlie_stats.packets_received,
+        "skill-group fallback RTP exchange complete"
+    );
+
+    assert!(
+        charlie_stats.packets_received > 0,
+        "skill-group agent should receive RTP from caller (got 0)"
+    );
+    assert!(
+        caller_stats.packets_received > 0,
+        "caller should receive RTP from the skill-group agent (got 0)"
+    );
+
+    caller_ua.hangup(&caller_id).await?;
+    server.stop();
+    Ok(())
+}
+
 /// Call-graph engine: caller hangup must cascade and tear down the agent leg.
 /// This is THE prod bug ("caller hangs up but agent keeps ringing/connected")
 /// the event-driven controller is designed to fix structurally.
