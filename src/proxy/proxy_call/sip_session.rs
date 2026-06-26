@@ -8772,11 +8772,17 @@ impl SipSession {
             _ => return Err(anyhow!("Only file/URL playback supported")),
         };
 
+        // Render playback in the codec the CALLER actually negotiated (its
+        // answer), not the first codec it merely offered. When a single codec
+        // is pinned (e.g. PCMA) the offer's first entry (often PCMU) differs
+        // from the negotiated payload type, and sending the offer-first codec
+        // makes the caller drop every packet as an unknown PT — silent audio.
         let codec_info = self
             .media
-            .caller_offer
+            .answer
             .as_ref()
-            .map(|offer| MediaNegotiator::extract_codec_params(offer).audio)
+            .or(self.media.caller_offer.as_ref())
+            .map(|sdp| MediaNegotiator::extract_codec_params(sdp).audio)
             .and_then(|codecs| codecs.first().cloned())
             .unwrap_or_else(|| {
                 let codec = CodecType::PCMU;

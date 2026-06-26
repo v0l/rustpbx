@@ -230,9 +230,15 @@ impl QueueBackend for SipSessionQueueBackend<'_> {
             .map(|e| e.dialog.clone());
         if let Some(dialog) = dialog {
             info!(%node, "queue-graph: CANCEL ringing target");
-            if let Err(e) = dialog.cancel().await {
-                warn!(%node, error = %e, "queue-graph: CANCEL failed");
-            }
+            // Fire-and-forget: awaiting the CANCEL transaction can block ~32s on
+            // Timer F when the callee (often NAT'd) never answers the CANCEL,
+            // which would stall the hunt/teardown. The dialog still terminates.
+            let node = node.clone();
+            tokio::spawn(async move {
+                if let Err(e) = dialog.cancel().await {
+                    warn!(%node, error = %e, "queue-graph: CANCEL failed");
+                }
+            });
         }
     }
 
@@ -597,7 +603,20 @@ impl SipSession {
                 // play-then-hangup): hand back to the existing, battle-tested
                 // fallback machinery now that the channels are free again.
                 info!("queue-graph: delegating to execute_queue_fallback");
-                self.execute_queue_fallback(plan, callee_state_rx).await
+                let result = self.execute_queue_fallback(plan, callee_state_rx).await;
+                // If the fallback ends in a hangup but the caller was already
+                // answered (greeting / hold music), `process()` would try to
+                // reject() a confirmed dialog — a no-op that leaves the caller
+                // hung. Send a BYE here instead and report success.
+                if result.is_err() && self.server_dialog.state().is_confirmed() {
+                    info!("queue-graph: fallback hangup on answered caller — sending BYE");
+                    if let Err(e) = self.server_dialog.bye().await {
+                        warn!(error = %e, "queue-graph: caller BYE after fallback failed");
+                    }
+                    self.cancel_token.cancel();
+                    return Ok(());
+                }
+                result
             }
             other => {
                 info!(?other, "queue-graph: ended without connection");
