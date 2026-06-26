@@ -273,6 +273,7 @@ mod tests {
             ring_timeout: ring,
             accept_immediately: true,
             has_hold_music: true,
+            has_greeting: false,
             fallback: crate::call::graph::model::FallbackPlan::Hangup(486),
         }
     }

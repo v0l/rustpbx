@@ -75,6 +75,8 @@ struct SipSessionQueueBackend<'a> {
     origin: rsipstack::sip::Request,
     dials: Shared,
     hold_audio: Option<String>,
+    greeting_audio: Option<String>,
+    final_dest_prompt: Option<String>,
     default_expires: u64,
 }
 
@@ -187,6 +189,18 @@ impl QueueBackend for SipSessionQueueBackend<'_> {
     }
 
     async fn dial_fallback(&mut self, node: &NodeId) -> Result<()> {
+        // Play the final-destination prompt (if any) before routing to the
+        // fallback destination, matching execute_queue_fallback.
+        if let Some(prompt) = self.final_dest_prompt.clone() {
+            self.session.prepare_queue_playback_media().await;
+            if let Err(e) = self
+                .session
+                .play_audio_file(&prompt, true, "queue-final-prompt", false)
+                .await
+            {
+                warn!(error = %e, file = %prompt, "queue-graph: failed to play final-destination prompt");
+            }
+        }
         // Prefer a locator-resolved target (internal / registered / external
         // realm); otherwise route the raw URI via an outbound trunk (PSTN).
         if let Some(target) = self.fallback_targets.first().cloned() {
@@ -262,19 +276,37 @@ impl QueueBackend for SipSessionQueueBackend<'_> {
     }
 
     async fn start_player(&mut self, kind: PlayerKind) {
-        if !matches!(kind, PlayerKind::Hold) {
-            return;
-        }
-        let Some(audio) = self.hold_audio.clone() else {
-            return;
-        };
-        self.session.prepare_queue_playback_media().await;
-        if let Err(e) = self
-            .session
-            .play_audio_file(&audio, false, SipSession::QUEUE_HOLD_TRACK_ID, true)
-            .await
-        {
-            warn!(error = %e, "queue-graph: failed to start hold music");
+        match kind {
+            PlayerKind::Hold => {
+                let Some(audio) = self.hold_audio.clone() else {
+                    return;
+                };
+                self.session.prepare_queue_playback_media().await;
+                if let Err(e) = self
+                    .session
+                    .play_audio_file(&audio, false, SipSession::QUEUE_HOLD_TRACK_ID, true)
+                    .await
+                {
+                    warn!(error = %e, "queue-graph: failed to start hold music");
+                }
+            }
+            PlayerKind::Prompt => {
+                // Greeting / transfer prompt: answer the caller (if needed) and
+                // play to completion before the hunt dials. No agent is ringing
+                // yet, so blocking here cannot strand a callee leg.
+                let Some(audio) = self.greeting_audio.clone() else {
+                    return;
+                };
+                self.session.prepare_queue_playback_media().await;
+                info!(file = %audio, "queue-graph: playing greeting prompt");
+                if let Err(e) = self
+                    .session
+                    .play_audio_file(&audio, true, "queue-transfer-prompt", false)
+                    .await
+                {
+                    warn!(error = %e, file = %audio, "queue-graph: failed to play greeting prompt");
+                }
+            }
         }
     }
 
@@ -432,14 +464,48 @@ impl SipSession {
             }
         };
 
-        let targets = self
+        let mut targets = self
             .resolve_custom_targets(agents, plan.acd_policy.as_deref())
             .await;
+
+        // Apply the queue location enricher (skill-group resolution, CRM header
+        // injection, etc.) exactly as the imperative execute_queue path does.
+        if let Some(enricher) = &self.server.queue_location_enricher {
+            let caller_headers: Vec<rsipstack::sip::Header> = self
+                .server_dialog
+                .initial_request()
+                .headers
+                .iter()
+                .cloned()
+                .collect();
+            targets = enricher
+                .enrich(
+                    targets,
+                    &crate::proxy::call::QueueEnrichContext {
+                        session_id: &self.context.session_id.to_string(),
+                        queue_name: &plan.queue_name,
+                        caller_headers: &caller_headers,
+                    },
+                )
+                .await;
+        }
 
         let hold_audio = plan
             .hold
             .as_ref()
             .and_then(|h| h.audio_file.clone());
+        let greeting_audio = plan
+            .voice_prompts
+            .as_ref()
+            .and_then(|p| p.transfer_prompt.clone())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let final_dest_prompt = plan
+            .voice_prompts
+            .as_ref()
+            .and_then(|p| p.final_destination_prompt.clone())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         // Map the queue's fallback action onto the graph's fallback plan. A
         // redirect / transfer-to-URI becomes a dial+bridge of one more callee
@@ -481,6 +547,7 @@ impl SipSession {
             ring_timeout: plan.ring_timeout,
             accept_immediately: plan.accept_immediately,
             has_hold_music: hold_audio.is_some(),
+            has_greeting: greeting_audio.is_some(),
             fallback: fallback_plan,
         };
 
@@ -501,6 +568,8 @@ impl SipSession {
             origin,
             dials: dials.clone(),
             hold_audio,
+            greeting_audio,
+            final_dest_prompt,
             default_expires,
         };
         let source = CalleeEventTranslator {
@@ -522,6 +591,13 @@ impl SipSession {
             GraphPhase::Connected => {
                 info!("queue-graph: target connected; handing off to main loop");
                 Ok(())
+            }
+            GraphPhase::Fallback => {
+                // Complex fallback (re-enqueue / IVR / skill-group /
+                // play-then-hangup): hand back to the existing, battle-tested
+                // fallback machinery now that the channels are free again.
+                info!("queue-graph: delegating to execute_queue_fallback");
+                self.execute_queue_fallback(plan, callee_state_rx).await
             }
             other => {
                 info!(?other, "queue-graph: ended without connection");
@@ -551,12 +627,14 @@ impl SipSession {
                 let c = code.as_ref().map(|s| s.code()).unwrap_or(486);
                 (FallbackPlan::Hangup(c), None)
             }
-            Some(QueueFallbackAction::Failure(FailureAction::PlayThenHangup {
-                status_code,
-                ..
-            })) => (FallbackPlan::Hangup(status_code.code()), None),
-            // None, re-queue, skill-group, IVR transfer: clean busy in v1.
-            _ => (FallbackPlan::Hangup(486), None),
+            // Play-then-hangup, transfer-to-queue/IVR, re-enqueue and
+            // skill-group are delegated to execute_queue_fallback (which already
+            // plays prompts and runs those actions).
+            Some(QueueFallbackAction::Failure(FailureAction::PlayThenHangup { .. })) => {
+                (FallbackPlan::Delegate, None)
+            }
+            None => (FallbackPlan::Hangup(486), None),
+            _ => (FallbackPlan::Delegate, None),
         }
     }
 }

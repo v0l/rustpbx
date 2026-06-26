@@ -58,6 +58,10 @@ pub enum FallbackPlan {
     Hangup(u16),
     /// Dial a fallback target as one more callee leg and bridge on answer.
     DialBridge,
+    /// Hand the fallback back to the host (re-enqueue / IVR / skill-group /
+    /// play-then-hangup): the controller ends in `Fallback` phase and the
+    /// caller's host runs the existing fallback machinery.
+    Delegate,
 }
 
 /// Hunt strategy for the candidate targets.
@@ -84,6 +88,9 @@ pub struct GraphConfig {
     pub accept_immediately: bool,
     /// Whether hold music is configured.
     pub has_hold_music: bool,
+    /// Whether a greeting/transfer prompt should play to the caller before the
+    /// hunt begins.
+    pub has_greeting: bool,
     /// What to do when all candidate targets are exhausted.
     pub fallback: FallbackPlan,
 }

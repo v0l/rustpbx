@@ -69,14 +69,24 @@ impl QueueGraph {
         if self.config.accept_immediately {
             fx.push(Effect::AnswerCaller);
         }
+        // Greeting/transfer prompt plays first (before dialing). The backend
+        // answers the caller leg as needed and plays to completion.
+        if self.config.has_greeting {
+            fx.push(Effect::StartPlayer {
+                kind: PlayerKind::Prompt,
+            });
+        }
         if self.config.has_hold_music {
             fx.push(Effect::StartPlayer {
                 kind: PlayerKind::Hold,
             });
         }
-        // Both an immediate answer and hold music answer the caller leg, so a
-        // 180 ringback relay is only meaningful when neither is configured.
-        self.caller_answered = self.config.accept_immediately || self.config.has_hold_music;
+        // Answering immediately, the greeting, or hold music all answer the
+        // caller leg, so a 180 ringback relay is only meaningful when none are
+        // configured.
+        self.caller_answered = self.config.accept_immediately
+            || self.config.has_greeting
+            || self.config.has_hold_music;
 
         if self.config.target_count == 0 {
             self.exhaust(&mut fx);
@@ -259,6 +269,12 @@ impl QueueGraph {
                 }
                 self.active.push(node);
             }
+            FallbackPlan::Delegate => {
+                // Hand control back to the host, which runs the existing
+                // fallback machinery (prompts / re-enqueue / IVR / skill-group).
+                self.phase = GraphPhase::Fallback;
+                fx.push(Effect::EndGraph);
+            }
         }
     }
 
@@ -302,6 +318,7 @@ mod tests {
             ring_timeout: Some(Duration::from_secs(20)),
             accept_immediately: true,
             has_hold_music: true,
+            has_greeting: false,
             fallback: FallbackPlan::Hangup(486),
         }
     }
@@ -551,6 +568,23 @@ mod tests {
         assert!(fx.contains(&Effect::HangupCaller { code: 486 }));
         assert!(fx.contains(&Effect::EndGraph));
         assert_eq!(g.phase(), GraphPhase::Ended);
+    }
+
+    #[test]
+    fn exhausted_with_delegate_ends_in_fallback_phase() {
+        let mut c = cfg(Strategy::Sequential, 1);
+        c.fallback = FallbackPlan::Delegate;
+        let mut g = QueueGraph::new(c);
+        g.start();
+        let fx = g.on_event(GraphEvent::CalleeRejected {
+            node: callee(0),
+            code: 480,
+        });
+        // No hangup / no dial: control is handed back to the host.
+        assert!(!fx.iter().any(|e| matches!(e, Effect::HangupCaller { .. })));
+        assert!(!fx.iter().any(|e| matches!(e, Effect::DialFallback { .. })));
+        assert!(fx.contains(&Effect::EndGraph));
+        assert_eq!(g.phase(), GraphPhase::Fallback);
     }
 
     /// With no answer and no immediate-answer/hold, a ringing callee relays 180.

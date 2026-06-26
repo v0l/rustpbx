@@ -115,8 +115,29 @@ concrete `destination`:
   `test_queue_graph_fallback_via_trunk` (gateway TestUa behind an outbound trunk
   → two-way RTP).
 
-`FallbackPlan::Hangup(code)` covers explicit failure-code fallbacks. **Remaining:**
-re-queue / skill-group fallbacks are a clean busy in this version.
+`FallbackPlan::Hangup(code)` covers explicit failure-code fallbacks.
+`FallbackPlan::Delegate` hands the remaining fallback action types
+(play-then-hangup, transfer-to-queue/IVR, re-enqueue, skill-group) back to the
+existing `execute_queue_fallback` once the controller returns in `Fallback`
+phase — the channels are free again, so all that battle-tested logic (incl. its
+prompts) is reused rather than reimplemented.
+
+## 6c. Feature parity with the imperative `execute_queue`
+
+| Feature | Status in call-graph engine |
+|---|---|
+| accept_immediately, hold music, seq/parallel dial, ring_timeout | ✓ |
+| caller-hangup / BYE cascade | ✓ (fixed vs imperative) |
+| transfer_prompt (greeting before bridge) | ✓ `StartPlayer{Prompt}` |
+| location enricher (skill-group / CRM headers) | ✓ |
+| fallback: hangup(code) | ✓ |
+| fallback: redirect / transfer-URI / PSTN (dial+bridge) | ✓ (better than REFER) |
+| fallback: final_destination_prompt | ✓ (before fallback dial) |
+| fallback: play-then-hangup / re-enqueue / IVR / skill-group | ✓ via `Delegate` |
+| 183 early-media passthrough (passthrough_ringback) | ✗ — 180 ringback only (off in prod) |
+
+The only remaining gap is in-band 183 early-media passthrough; 180 ringback is
+relayed so the caller hears local ringback during the hunt.
 
 Ringback: when the caller is neither answered immediately nor on hold music, a
 callee `180` relays a `RelayCallerRinging` effect so the caller hears ringback
