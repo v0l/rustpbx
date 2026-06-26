@@ -494,6 +494,7 @@ impl SipSession {
             .hold
             .as_ref()
             .and_then(|h| h.audio_file.clone());
+        let hold_loop = plan.hold.as_ref().map(|h| h.loop_playback).unwrap_or(true);
         let greeting_audio = plan
             .voice_prompts
             .as_ref()
@@ -573,7 +574,7 @@ impl SipSession {
         if let Some(audio) = hold_audio {
             hooks.insert(
                 HookPoint::HoldStart,
-                HookSpec::play(audio, false, true, SipSession::QUEUE_HOLD_TRACK_ID),
+                HookSpec::play(audio, false, hold_loop, SipSession::QUEUE_HOLD_TRACK_ID),
             );
             hooks.insert(
                 HookPoint::HoldStop,

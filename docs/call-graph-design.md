@@ -122,22 +122,71 @@ existing `execute_queue_fallback` once the controller returns in `Fallback`
 phase — the channels are free again, so all that battle-tested logic (incl. its
 prompts) is reused rather than reimplemented.
 
-## 6c. Feature parity with the imperative `execute_queue`
+## 6c. Feature parity audit vs the imperative `execute_queue`
 
-| Feature | Status in call-graph engine |
-|---|---|
-| accept_immediately, hold music, seq/parallel dial, ring_timeout | ✓ |
-| caller-hangup / BYE cascade | ✓ (fixed vs imperative) |
-| transfer_prompt (greeting before bridge) | ✓ `StartPlayer{Prompt}` |
-| location enricher (skill-group / CRM headers) | ✓ |
-| fallback: hangup(code) | ✓ |
-| fallback: redirect / transfer-URI / PSTN (dial+bridge) | ✓ (better than REFER) |
-| fallback: final_destination_prompt | ✓ (before fallback dial) |
-| fallback: play-then-hangup / re-enqueue / IVR / skill-group | ✓ via `Delegate` |
-| 183 early-media passthrough (passthrough_ringback) | ✗ — 180 ringback only (off in prod) |
+Reference: `sip_session/queue.rs` (`execute_queue` + `execute_queue_fallback`)
+and the `QueuePlan` surface. ✓ = parity, ↑ = call-graph is strictly better,
+△ = minor/edge difference, ✗ = not implemented (in either, unless noted).
 
-The only remaining gap is in-band 183 early-media passthrough; 180 ringback is
-relayed so the caller hears local ringback during the hunt.
+### Dial / hunt
+| Behaviour | Legacy | Call-graph |
+|---|---|---|
+| Sequential / Parallel dial | ✓ | ✓ |
+| `ring_timeout` enforcement | ✓ (`tokio::timeout`) | ↑ controller timer + **non-blocking CANCEL** (legacy `dial.cancel().await` can stall ~32s on Timer F) |
+| `acd_policy` → `resolve_custom_targets` | ✓ | ✓ |
+| skill-group resolution (AgentRegistry) | ✓ | ✓ |
+| `queue_location_enricher` | ✓ | ✓ |
+| caller hangup while ringing → cancel agent | △ **100 ms poll (racey)** | ↑ first-class event (~47 ms, deterministic) |
+| reject → next target | ✓ | ↑ immediate |
+| anchored audio, recording, session timer, codec negotiation | ✓ | ✓ (same `try_single_target`/`finalize_callee_connection`) |
+| BYE cascade (either direction) | △ (in-dialog BYE bugs) | ↑ fixed |
+
+### Caller answer / media
+| Behaviour | Legacy | Call-graph |
+|---|---|---|
+| `accept_immediately` | ✓ | ✓ |
+| hold music + `loop_playback` | ✓ | ✓ |
+| 180 ringback relay | ✓ | ✓ |
+| caller-playback codec | △ offer-first (latent bug) | ↑ **negotiated codec** (fixes PCMA-pinned silence) |
+| 183 early-media passthrough (`passthrough_ringback`) | ✗ (field unwired) | ✗ (field unwired — not a regression) |
+
+### Prompts
+| Behaviour | Legacy | Call-graph |
+|---|---|---|
+| `transfer_prompt` (greeting) | ✓ | ✓ (`Greeting` hook) |
+| `no_answer_prompt`/`busy_prompt`/`failure_audio` before hangup | △ only `failure_audio` | ↑ `NoAnswer` hook: `failure_audio` → `no_answer_prompt` → `busy_prompt` |
+| `final_destination_prompt` before fallback | ✓ (all paths) | △ on Delegate + DialBridge, **not** plain-hangup |
+| `comfort_prompts`/`position_prompt`/`wait_time_prompt`/`callback_*` | ✗ (app-runtime only) | ✗ (not this path) |
+
+### Fallback (`QueueFallbackAction`)
+| Behaviour | Legacy | Call-graph |
+|---|---|---|
+| `Failure(Hangup{code})` | ✓ | ✓ (`Hangup`) |
+| `Redirect` / `Transfer(Uri)` incl. PSTN | △ REFER (**broken for Twilio/PSTN**) | ↑ dial+bridge, trunk-routed |
+| `Failure(PlayThenHangup)` | ✓ | ✓ via `Delegate` → `execute_queue_fallback` |
+| `Transfer(Queue)` re-enqueue | ✓ | ✓ via `Delegate` |
+| `Transfer(Ivr)` | ✓ | ✓ via `Delegate` |
+| `Queue{skill-group}` | ✓ | ✓ via `Delegate` |
+| default (none) → busy | ✓ | ✓ |
+
+### Edge cases / cosmetic
+| Behaviour | Legacy | Call-graph |
+|---|---|---|
+| no `dial_strategy` | `Ok` (no-op) | `Err(TemporarilyUnavailable)` △ |
+| targets configured but none resolve | greeting + fallback | greeting + fallback ✓ |
+| **zero** targets configured | `Ok` (no fallback) | exhaust → fallback △ |
+| `label` → snapshot/CDR name | set | not set △ (cosmetic) |
+| `retry_codes`, `no_trying_timeout` | ✗ (unwired) | ✗ (unwired — not a regression) |
+
+### Net
+At or above parity on every wired behaviour; strictly better on event-driven
+caller-hangup, non-blocking CANCEL, PSTN/trunk fallback, negotiated-codec
+playback, and prompt extensibility. Remaining true gaps (all minor, tracked):
+1. `final_destination_prompt` not played on the plain-hangup path (is on
+   Delegate/DialBridge); `failure_audio` not played on the DialBridge path.
+2. Edge semantics: no-`dial_strategy` and zero-targets differ slightly.
+3. `label`-as-snapshot-name not carried.
+4. 183 early-media passthrough — absent in both; a genuine future want.
 
 Ringback: when the caller is neither answered immediately nor on hold music, a
 callee `180` relays a `RelayCallerRinging` effect so the caller hears ringback
