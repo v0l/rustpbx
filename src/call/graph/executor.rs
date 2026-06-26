@@ -14,7 +14,7 @@
 //! timers, so caller-hangup / reject / timeout are all first-class events —
 //! never polled.
 
-use super::model::{Effect, GraphEvent, GraphPhase, NodeId, PlayerKind};
+use super::model::{Effect, GraphEvent, GraphPhase, HookPoint, NodeId};
 use super::reducer::QueueGraph;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -45,10 +45,10 @@ pub trait QueueBackend: Send {
     async fn answer_caller(&mut self);
     /// Release the caller leg (BYE if answered, else final response `code`).
     async fn hangup_caller(&mut self, code: u16);
-    /// Start a player (hold music / prompt) toward the caller.
-    async fn start_player(&mut self, kind: PlayerKind);
-    /// Stop a player.
-    async fn stop_player(&mut self, kind: PlayerKind);
+    /// Run whatever behaviour is bound to a lifecycle point (voice prompt, hold
+    /// music, …). A no-op if nothing is bound. Blocking points (greeting,
+    /// no-answer, before-fallback) play to completion before returning.
+    async fn run_hook(&mut self, point: HookPoint);
     /// Bridge two nodes' audio bidirectionally.
     async fn bridge(&mut self, a: &NodeId, b: &NodeId);
     /// Remove all audio edges touching `node`.
@@ -170,8 +170,7 @@ impl<B: QueueBackend> QueueController<B> {
                         token.cancel();
                     }
                 }
-                Effect::StartPlayer { kind } => self.backend.start_player(kind).await,
-                Effect::StopPlayer { kind } => self.backend.stop_player(kind).await,
+                Effect::RunHook { point } => self.backend.run_hook(point).await,
                 Effect::Bridge { a, b } => self.backend.bridge(&a, &b).await,
                 Effect::ClearRoutes { node } => self.backend.clear_routes(&node).await,
                 Effect::DialFallback { node } => {
@@ -245,11 +244,8 @@ mod tests {
         async fn hangup_caller(&mut self, code: u16) {
             self.push(format!("hangup_caller {code}"));
         }
-        async fn start_player(&mut self, kind: PlayerKind) {
-            self.push(format!("start_player {kind:?}"));
-        }
-        async fn stop_player(&mut self, kind: PlayerKind) {
-            self.push(format!("stop_player {kind:?}"));
+        async fn run_hook(&mut self, point: HookPoint) {
+            self.push(format!("hook {point:?}"));
         }
         async fn bridge(&mut self, a: &NodeId, b: &NodeId) {
             self.push(format!("bridge {a} {b}"));
@@ -272,8 +268,6 @@ mod tests {
             target_count: n,
             ring_timeout: ring,
             accept_immediately: true,
-            has_hold_music: true,
-            has_greeting: false,
             fallback: crate::call::graph::model::FallbackPlan::Hangup(486),
         }
     }
@@ -305,11 +299,13 @@ mod tests {
             calls,
             vec![
                 "answer_caller".to_string(),
-                "start_player Hold".to_string(),
+                "hook Greeting".to_string(),
+                "hook HoldStart".to_string(),
                 "dial callee-0 idx=0".to_string(),
-                "stop_player Hold".to_string(),
+                "hook HoldStop".to_string(),
                 "bridge caller callee-0".to_string(),
                 "hangup_callee callee-0".to_string(),
+                "hook HoldStop".to_string(),
             ]
         );
     }
@@ -368,8 +364,7 @@ mod tests {
             async fn hangup_callee(&mut self, _n: &NodeId) {}
             async fn answer_caller(&mut self) {}
             async fn hangup_caller(&mut self, _c: u16) {}
-            async fn start_player(&mut self, _k: PlayerKind) {}
-            async fn stop_player(&mut self, _k: PlayerKind) {}
+            async fn run_hook(&mut self, _p: HookPoint) {}
             async fn bridge(&mut self, _a: &NodeId, _b: &NodeId) {}
             async fn clear_routes(&mut self, _n: &NodeId) {}
             async fn dial_fallback(&mut self, _n: &NodeId) -> Result<()> {

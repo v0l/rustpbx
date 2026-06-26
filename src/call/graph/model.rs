@@ -42,13 +42,29 @@ impl std::fmt::Display for NodeId {
     }
 }
 
-/// Kind of audio player node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlayerKind {
-    /// Hold music played to the caller while hunting.
-    Hold,
-    /// A one-shot prompt (transfer / final-destination prompt).
-    Prompt,
+/// Lifecycle points in the queue graph that the reducer announces and to which
+/// behaviours (voice prompts, hold music, future hooks) bind. The reducer is
+/// agnostic to what — if anything — is attached: it always emits the point and
+/// the backend runs whatever is registered (a no-op if nothing).
+///
+/// Adding a new prompt is therefore a *data* change (bind audio to a point),
+/// not a change to the reducer or executor. New points are added here only when
+/// a genuinely new moment in the lifecycle is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HookPoint {
+    /// Caller has entered the queue, before any target is dialed. Blocking:
+    /// the hunt waits for this to finish (e.g. a greeting / transfer prompt).
+    Greeting,
+    /// Begin background hold media while hunting (looping, non-blocking).
+    HoldStart,
+    /// Stop background hold media.
+    HoldStop,
+    /// All targets exhausted, before a hangup fallback. Blocking (e.g. a
+    /// no-answer / busy prompt).
+    NoAnswer,
+    /// Before dialing a fallback destination. Blocking (e.g. a
+    /// final-destination prompt).
+    BeforeFallbackDial,
 }
 
 /// What to do once all candidate targets are exhausted.
@@ -86,11 +102,6 @@ pub struct GraphConfig {
     pub ring_timeout: Option<Duration>,
     /// Whether to answer (200 OK) the caller immediately on entry.
     pub accept_immediately: bool,
-    /// Whether hold music is configured.
-    pub has_hold_music: bool,
-    /// Whether a greeting/transfer prompt should play to the caller before the
-    /// hunt begins.
-    pub has_greeting: bool,
     /// What to do when all candidate targets are exhausted.
     pub fallback: FallbackPlan,
 }
@@ -159,10 +170,9 @@ pub enum Effect {
     StartRingTimer { node: NodeId, timeout: Duration },
     /// Disarm the per-target ring timer.
     CancelRingTimer { node: NodeId },
-    /// Start a player node (hold music / prompt) toward the caller.
-    StartPlayer { kind: PlayerKind },
-    /// Stop a player node.
-    StopPlayer { kind: PlayerKind },
+    /// Run whatever behaviour is bound to a lifecycle point (voice prompt,
+    /// hold music, …). The backend resolves the point to an action.
+    RunHook { point: HookPoint },
     /// Add a bidirectional audio bridge edge between two nodes.
     Bridge { a: NodeId, b: NodeId },
     /// Remove all audio edges touching `node`.

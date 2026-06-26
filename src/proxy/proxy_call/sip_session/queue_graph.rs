@@ -16,7 +16,7 @@
 use super::{CalleeError, SipSession, into_callee_err};
 use crate::call::graph::executor::EventSource;
 use crate::call::graph::{
-    FallbackPlan, GraphConfig, GraphEvent, GraphPhase, NodeId, PlayerKind, QueueBackend,
+    FallbackPlan, GraphConfig, GraphEvent, GraphPhase, HookPoint, NodeId, QueueBackend,
     QueueController, QueueGraph, Strategy,
 };
 use crate::call::{DialDirection, RoutingState};
@@ -74,10 +74,34 @@ struct SipSessionQueueBackend<'a> {
     /// The inbound INVITE, used as the `origin` for outbound trunk routing.
     origin: rsipstack::sip::Request,
     dials: Shared,
-    hold_audio: Option<String>,
-    greeting_audio: Option<String>,
-    final_dest_prompt: Option<String>,
+    /// Behaviours bound to lifecycle points. Adding a prompt is a matter of
+    /// inserting an entry here — no reducer/executor change.
+    hooks: HashMap<HookPoint, HookSpec>,
     default_expires: u64,
+}
+
+/// A bound lifecycle behaviour: play (or stop) an audio track on the caller.
+#[derive(Clone)]
+struct HookSpec {
+    /// File to play; `None` together with `stop = true` means "stop the track".
+    audio: Option<String>,
+    /// Await playback completion before returning (greeting / prompts).
+    blocking: bool,
+    /// Loop the audio (hold music).
+    looping: bool,
+    /// Track id for the playback (and for stopping it).
+    track_id: &'static str,
+    /// Stop the track instead of playing.
+    stop: bool,
+}
+
+impl HookSpec {
+    fn play(audio: String, blocking: bool, looping: bool, track_id: &'static str) -> Self {
+        Self { audio: Some(audio), blocking, looping, track_id, stop: false }
+    }
+    fn stop(track_id: &'static str) -> Self {
+        Self { audio: None, blocking: false, looping: false, track_id, stop: true }
+    }
 }
 
 impl SipSessionQueueBackend<'_> {
@@ -189,18 +213,8 @@ impl QueueBackend for SipSessionQueueBackend<'_> {
     }
 
     async fn dial_fallback(&mut self, node: &NodeId) -> Result<()> {
-        // Play the final-destination prompt (if any) before routing to the
-        // fallback destination, matching execute_queue_fallback.
-        if let Some(prompt) = self.final_dest_prompt.clone() {
-            self.session.prepare_queue_playback_media().await;
-            if let Err(e) = self
-                .session
-                .play_audio_file(&prompt, true, "queue-final-prompt", false)
-                .await
-            {
-                warn!(error = %e, file = %prompt, "queue-graph: failed to play final-destination prompt");
-            }
-        }
+        // The final-destination prompt is played by the BeforeFallbackDial hook
+        // (emitted by the reducer just before this), so nothing to play here.
         // Prefer a locator-resolved target (internal / registered / external
         // realm); otherwise route the raw URI via an outbound trunk (PSTN).
         if let Some(target) = self.fallback_targets.first().cloned() {
@@ -281,45 +295,25 @@ impl QueueBackend for SipSessionQueueBackend<'_> {
         }
     }
 
-    async fn start_player(&mut self, kind: PlayerKind) {
-        match kind {
-            PlayerKind::Hold => {
-                let Some(audio) = self.hold_audio.clone() else {
-                    return;
-                };
-                self.session.prepare_queue_playback_media().await;
-                if let Err(e) = self
-                    .session
-                    .play_audio_file(&audio, false, SipSession::QUEUE_HOLD_TRACK_ID, true)
-                    .await
-                {
-                    warn!(error = %e, "queue-graph: failed to start hold music");
-                }
-            }
-            PlayerKind::Prompt => {
-                // Greeting / transfer prompt: answer the caller (if needed) and
-                // play to completion before the hunt dials. No agent is ringing
-                // yet, so blocking here cannot strand a callee leg.
-                let Some(audio) = self.greeting_audio.clone() else {
-                    return;
-                };
-                self.session.prepare_queue_playback_media().await;
-                info!(file = %audio, "queue-graph: playing greeting prompt");
-                if let Err(e) = self
-                    .session
-                    .play_audio_file(&audio, true, "queue-transfer-prompt", false)
-                    .await
-                {
-                    warn!(error = %e, file = %audio, "queue-graph: failed to play greeting prompt");
-                }
-            }
+    async fn run_hook(&mut self, point: HookPoint) {
+        let Some(spec) = self.hooks.get(&point).cloned() else {
+            return; // nothing bound to this lifecycle point
+        };
+        if spec.stop {
+            self.session.stop_playback_track(spec.track_id, false).await;
+            return;
         }
-    }
-
-    async fn stop_player(&mut self, _kind: PlayerKind) {
-        self.session
-            .stop_playback_track(SipSession::QUEUE_HOLD_TRACK_ID, false)
-            .await;
+        let Some(audio) = spec.audio else { return };
+        // Answer the caller (if not already) so the prompt/hold is audible.
+        self.session.prepare_queue_playback_media().await;
+        info!(?point, file = %audio, blocking = spec.blocking, "queue-graph: running hook");
+        if let Err(e) = self
+            .session
+            .play_audio_file(&audio, spec.blocking, spec.track_id, spec.looping)
+            .await
+        {
+            warn!(error = %e, file = %audio, ?point, "queue-graph: hook playback failed");
+        }
     }
 
     async fn bridge(&mut self, _a: &NodeId, b: &NodeId) {
@@ -512,6 +506,18 @@ impl SipSession {
             .and_then(|p| p.final_destination_prompt.clone())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        // No-answer / busy prompt: prefer an explicit fallback failure_audio,
+        // then the queue's no_answer_prompt / busy_prompt voice prompt.
+        let failure_audio = plan
+            .failure_audio
+            .clone()
+            .or_else(|| {
+                plan.voice_prompts.as_ref().and_then(|p| {
+                    p.no_answer_prompt.clone().or_else(|| p.busy_prompt.clone())
+                })
+            })
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         // Map the queue's fallback action onto the graph's fallback plan. A
         // redirect / transfer-to-URI becomes a dial+bridge of one more callee
@@ -552,10 +558,40 @@ impl SipSession {
             target_count: targets.len(),
             ring_timeout: plan.ring_timeout,
             accept_immediately: plan.accept_immediately,
-            has_hold_music: hold_audio.is_some(),
-            has_greeting: greeting_audio.is_some(),
             fallback: fallback_plan,
         };
+
+        // Bind voice prompts / hold music to lifecycle points. This map is the
+        // single extension surface for prompts — add an entry, nothing else.
+        let mut hooks: HashMap<HookPoint, HookSpec> = HashMap::new();
+        if let Some(audio) = greeting_audio {
+            hooks.insert(
+                HookPoint::Greeting,
+                HookSpec::play(audio, true, false, "queue-transfer-prompt"),
+            );
+        }
+        if let Some(audio) = hold_audio {
+            hooks.insert(
+                HookPoint::HoldStart,
+                HookSpec::play(audio, false, true, SipSession::QUEUE_HOLD_TRACK_ID),
+            );
+            hooks.insert(
+                HookPoint::HoldStop,
+                HookSpec::stop(SipSession::QUEUE_HOLD_TRACK_ID),
+            );
+        }
+        if let Some(audio) = failure_audio {
+            hooks.insert(
+                HookPoint::NoAnswer,
+                HookSpec::play(audio, true, false, "queue-failure-prompt"),
+            );
+        }
+        if let Some(audio) = final_dest_prompt {
+            hooks.insert(
+                HookPoint::BeforeFallbackDial,
+                HookSpec::play(audio, true, false, "queue-final-prompt"),
+            );
+        }
 
         let default_expires = self
             .server
@@ -573,9 +609,7 @@ impl SipSession {
             fallback_uri,
             origin,
             dials: dials.clone(),
-            hold_audio,
-            greeting_audio,
-            final_dest_prompt,
+            hooks,
             default_expires,
         };
         let source = CalleeEventTranslator {

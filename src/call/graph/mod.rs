@@ -21,6 +21,6 @@ pub mod reducer;
 
 pub use executor::{QueueBackend, QueueController, QueueEventTx};
 pub use model::{
-    Effect, FallbackPlan, GraphConfig, GraphEvent, GraphPhase, NodeId, PlayerKind, Strategy,
+    Effect, FallbackPlan, GraphConfig, GraphEvent, GraphPhase, HookPoint, NodeId, Strategy,
 };
 pub use reducer::QueueGraph;
