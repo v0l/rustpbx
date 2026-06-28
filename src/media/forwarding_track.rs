@@ -605,6 +605,7 @@ mod tests {
                 channels: 1,
             }),
             transport: rustrtc::TransportMode::Rtp,
+            direction: rustrtc::Direction::SendRecv,
         }
     }
 

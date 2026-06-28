@@ -797,6 +797,10 @@ pub struct ProxyConfig {
     /// Parallel system for A/B testing; default off.
     #[serde(default)]
     pub queue_graph_engine: bool,
+    /// Route simple direct (Targets) calls through the new `call::session`
+    /// engine instead of the legacy `SipSession` god object. Default off.
+    #[serde(default)]
+    pub session_engine: bool,
     #[serde(default)]
     pub session_expires: Option<u64>,
     #[serde(default = "default_rtp_timeout")]
@@ -1212,6 +1216,7 @@ impl Default for ProxyConfig {
             session_timer: false,
             session_timer_always: false,
             queue_graph_engine: false,
+            session_engine: false,
             session_expires: None,
             rtp_timeout: default_rtp_timeout(),
             session_cmd_channel_capacity: default_session_cmd_channel_capacity(),

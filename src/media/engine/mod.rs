@@ -1742,6 +1742,7 @@ mod tests {
             video: None,
             dtmf: None,
             transport: rustrtc::TransportMode::Rtp,
+            direction: rustrtc::Direction::SendRecv,
         };
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();

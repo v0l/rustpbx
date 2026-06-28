@@ -94,6 +94,17 @@ impl TestUa {
         self.config.local_port
     }
 
+    /// The UA's dialog layer (for tests that drive it directly, e.g. exercising
+    /// `SipSession::dial` against this UA's endpoint).
+    pub fn dialog_layer(&self) -> Option<Arc<DialogLayer>> {
+        self.dialog_layer.clone()
+    }
+
+    /// The UA's Contact URI (its reachable address).
+    pub fn contact_uri(&self) -> Option<rsipstack::sip::Uri> {
+        self.contact_uri.clone()
+    }
+
     /// Start the UA with simplified initialization
     pub async fn start(&mut self) -> Result<()> {
         let transport_layer = TransportLayer::new(self.cancel_token.clone());

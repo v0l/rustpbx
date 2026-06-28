@@ -17,6 +17,7 @@ pub(crate) mod leg_registry;
 pub(crate) mod media_peer;
 pub(crate) mod media_state;
 pub(crate) mod reporter;
+pub(crate) mod session_engine;
 pub(crate) mod session_hooks;
 pub(crate) mod session_timer;
 pub(crate) mod sip_session;
@@ -114,6 +115,15 @@ impl CallSessionBuilder {
                     if meta.is_empty() { None } else { Some(meta) }
                 }),
         };
+
+        // Cutover (flagged, default off): route flows the new `call::session`
+        // engine fully covers (direct `Targets`, and simple `Queue` chains with
+        // hold/dial/ring-timeout) through it; everything else — announcements,
+        // failure audio, rich fallback, IVR/`Application`, … — stays on the god
+        // object.
+        if server.proxy_config.session_engine && session_engine::supports_flow(&dialplan.flow) {
+            return session_engine::serve(server, context, tx, cancel_token).await;
+        }
 
         SipSession::serve(server, context, tx, cancel_token, self.call_record_sender).await
     }

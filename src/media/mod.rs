@@ -21,6 +21,7 @@ use crate::media::recorder::RecorderOption;
 
 pub type TrackMap = HashMap<String, Arc<AsyncMutex<Box<dyn Track>>>>;
 
+pub mod audio_fifo;
 pub mod audio_source;
 pub mod bridge;
 #[cfg(test)]
@@ -34,6 +35,7 @@ pub mod negotiate;
 pub mod telephone_event;
 pub mod transcoder;
 pub mod transcoding_pipeline;
+pub mod unified_mixer;
 #[cfg(test)]
 mod unified_pc_tests;
 pub mod wav_reader;

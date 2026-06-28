@@ -94,6 +94,10 @@ pub struct NegotiatedLegProfile {
     pub dtmf: Option<NegotiatedCodec>,
     /// Transport mode for this leg (RTP or WebRTC/SRTP).
     pub transport: rustrtc::TransportMode,
+    /// Media flow direction for this leg, taken from the SDP `a=` line of the
+    /// audio m-line (falling back to video). Drives hold/resume
+    /// (`sendonly`/`recvonly`/`inactive`).
+    pub direction: rustrtc::Direction,
 }
 
 impl Default for NegotiatedLegProfile {
@@ -103,6 +107,7 @@ impl Default for NegotiatedLegProfile {
             video: None,
             dtmf: None,
             transport: rustrtc::TransportMode::Rtp,
+            direction: rustrtc::Direction::SendRecv,
         }
     }
 }
@@ -485,11 +490,25 @@ impl MediaNegotiator {
             }
         };
 
+        // Leg-level media direction from the audio m-line (fallback video).
+        let direction = SessionDescription::parse(SdpType::Answer, sdp)
+            .or_else(|_| SessionDescription::parse(SdpType::Offer, sdp))
+            .ok()
+            .and_then(|s| {
+                s.media_sections
+                    .iter()
+                    .find(|m| m.kind == MediaKind::Audio)
+                    .or_else(|| s.media_sections.iter().find(|m| m.kind == MediaKind::Video))
+                    .map(|m| m.direction)
+            })
+            .unwrap_or_default();
+
         NegotiatedLegProfile {
             audio,
             video,
             dtmf,
             transport: rustrtc::TransportMode::Rtp,
+            direction,
         }
     }
 

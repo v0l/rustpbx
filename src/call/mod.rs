@@ -26,6 +26,7 @@ pub mod graph;
 pub mod policy;
 pub mod queue_config;
 pub mod runtime;
+pub mod session;
 pub mod sip;
 pub mod user;
 pub use cookie::{
